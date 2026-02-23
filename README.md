@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # 🌊 Wave Energy Converters – Layout Optimization & Linear Regression
 
 Projeto desenvolvido para análise geométrica e modelagem preditiva da
