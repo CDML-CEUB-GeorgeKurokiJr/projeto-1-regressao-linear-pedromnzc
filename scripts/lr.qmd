@@ -1,0 +1,277 @@
+---
+title: "Projeto 1 - Regressão Linear WECs"
+subtitle: "Wave Energy Converters Dataset"
+author: 
+  - name: "Pedro Muniz Cherulli"
+    affiliation: "UniCEUB – Ciência de Dados"
+    orcid: "0009-0000-0282-5776"
+date: "`r Sys.Date()`"
+lang: pt-BR
+keywords: [R, Python, Ciência de Dados, Deep Learning, Regressão Linear]
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+params:
+  env_name: "D:/venvs/deep_learning"
+
+bibliography: "../data/raw/ABNT/referencias.bib"
+csl: "../data/raw/ABNT/abnt.csl"
+---
+
+```{r include=FALSE}
+env_name <- params$env_name
+
+python_path <- system(
+  "py -3.12 -c \"import sys; print(sys.executable)\"",
+  intern = TRUE
+)
+
+Sys.setlocale("LC_TIME", "pt_BR.UTF-8")
+```
+
+```{r include=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+pacman::p_load(
+  reticulate,
+  knitr,
+  rmarkdown,
+  arrow
+) 
+
+if (!virtualenv_exists(env_name)) {
+  virtualenv_create(env_name, python = python_path)
+}
+
+use_virtualenv(env_name, required = TRUE)
+
+py_pkgs <- c(
+  "pandas",
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "seaborn",
+  "scikit-learn",
+  "fastparquet"
+)
+
+installed_pkgs <- py_list_packages()$package
+missing_pkgs <- setdiff(py_pkgs, installed_pkgs)
+
+if (length(missing_pkgs) > 0) {
+  py_install(missing_pkgs, pip = TRUE)
+}
+
+reticulate::py_config()
+```
+
+# Introdução à Regressão Linear
+
+A **Regressão Linear** é um dos algoritmos fundamentais da Ciência de Dados.
+Seu objetivo principal é modelar a relação entre uma variável dependente (alvo/target) e uma ou mais variáveis independentes (preditores/features).
+
+No contexto deste projeto, estamos tentando prever a **potência total gerada (`Powerall`)** por fazendas de conversores de energia das ondas (WECs) com base em suas coordenadas geográficas e métricas de distância entre os dispositivos.
+
+## O Modelo Matemático
+
+A forma mais simples da regressão linear segue a equação de uma reta:
+
+$y = \beta_0 + \beta_1 x + \epsilon$
+
+Onde:
+
+-   $y$: Variável que queremos prever.
+
+-   $\beta_0$: O intercepto (onde a reta corta o eixo Y).
+
+-   $\beta_1$: O coeficiente angular (o "peso" de cada variável).
+
+-   $\epsilon$: O erro ou ruído aleatório.
+
+------------------------------------------------------------------------
+
+## Metodologia Aplicada
+
+### Segmentação por Cenários
+
+Dados de energia renovável costumam variar drasticamente dependendo da localização geográfica (Cenários).
+Em vez de um modelo único, foram aplicadas **quatro regressões independentes**, permitindo que o algoritmo aprenda as características físicas específicas de cada mar (Sydney, Adelaide, Perth e Tasmania).
+
+### Transformação Logarítmica
+
+Notamos que a variável alvo apresenta grande amplitude e variância.
+Aplicamos a transformação `log1p` ($log(1+x)$) para:
+
+1.  **Normalizar a distribuição** dos dados.
+
+2.  **Reduzir o impacto de outliers**, tornando a relação entre as variáveis mais linear.
+
+## Análise de Métricas de Avaliação
+
+Para nivelamento, utilizamos três métricas principais para julgar se o modelo é bom ou ruim:
+
+1.  $R^2$ (Coeficiente de Determinação): Indica quanto da variação dos dados é explicada pelo modelo.
+    Varia de 0 a 1 (ou 0% a 100%).
+    Quanto maior, melhor.
+
+2.  **MAE (Erro Médio Absoluto):** A média simples da distância entre o valor real e o previsto.
+    É fácil de interpretar, pois está na mesma unidade da potência (Watts).
+
+3.  **RMSE (Raiz do Erro Quadrático Médio):** Similar ao MAE, mas penaliza erros grandes com mais severidade.
+    É ideal para identificar modelos que falham drasticamente em alguns pontos.
+
+------------------------------------------------------------------------
+
+# Implementação do Código
+
+## Carregamento dos Dados
+
+Nesta etapa os dados processados são carregados para análise.
+
+```{python}
+import pandas as pd
+from pathlib import Path
+
+BASE_DIR = Path().resolve().parent
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+file_path = PROCESSED_DIR / "wec_all_processed.parquet"
+
+df = pd.read_parquet(file_path, engine="fastparquet")
+df
+```
+
+## Treinamento e Avaliação do Modelo
+
+O código abaixo realiza o processo de treinamento e avaliação da regressão linear para cada cenário, além de gerar gráficos de dispersão para visualizar a relação entre os valores reais e previstos.
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+cenarios = df['scenario'].unique()
+resultados = {}
+
+for local in cenarios:
+    df_region = df[df['scenario'] == local]
+
+    X = df_region.drop(columns=['Powerall', 'scenario'])
+    y = df_region['Powerall']
+
+    y_log = np.log1p(y)
+    
+    X_train, X_test, y_train_log, y_test_log = train_test_split(
+        X, y_log, test_size=0.2, random_state=42
+    )
+    
+    model = LinearRegression()
+    model.fit(X_train, y_train_log)
+    
+    y_pred_log = model.predict(X_test)
+    
+    y_pred = np.expm1(y_pred_log)
+    y_test = np.expm1(y_test_log)
+
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae = mean_absolute_error(y_test, y_pred)
+
+    sns.set(style="whitegrid")
+    
+    plt.figure(figsize=(7, 7));
+    plt.scatter(y_test, y_pred, alpha=0.5, color='blue');
+    min_val = min(y_test.min(), y_pred.min())
+    max_val = max(y_test.max(), y_pred.max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Previsão Perfeita');
+    plt.xlabel("Valores Reais");
+    plt.ylabel("Valores Previsto");
+    plt.title(f"Região: {local} - Previsões vs Valores Reais");
+    plt.legend();
+    plt.tight_layout();
+    plt.show();
+
+    resultados[local] = {'R2': r2, 'RMSE': rmse, 'MAE': mae}
+    print(f"Região: {local:10} | R²: {r2:.4f} | RMSE: {rmse:.2f} | MAE: {mae:.2f}")
+
+df_resultados = pd.DataFrame(resultados).T.sort_values(by='R2', ascending=False)
+print("\n--- Resumo Final ---")
+print(df_resultados)
+print(f"Resumo Estatístico da Vaiável Target\n{df['Powerall'].describe()}")
+```
+
+# Conclusões do Projeto
+
+Com base nas **Análises Finais**, observamos comportamentos distintos:
+
+-   **Sydney** apresentou o melhor ajuste ($R^2 \approx 0.89$), indicando que a disposição física dos WECs nesta região tem uma correlação linear muito forte com a energia produzida.
+
+-   **Tasmania** representou o maior desafio ($R^2 \approx 0.49$).
+    Isso sugere que, em mares de alta energia, a relação entre as variáveis é provavelmente **não-linear**, exigindo modelos mais complexos no futuro, como polinômios ou redes neurais.
+
+## Resumo das Métricas Obtidas
+
+Abaixo, a consolidação dos resultados que demonstram a variação de precisão conforme a complexidade do cenário:
+
+| Região | R² (Precisão) | Interpretação Técnica |
+|:-----------------------|:-----------------------|:-----------------------|
+| **Sydney** | 0.8923 | Alta Linearidade - Modelo Confiável |
+| **Adelaide** | 0.6451 | Linearidade Moderada - Perda de padrão físico |
+| **Perth** | 0.5917 | Linearidade Baixa - Necessita de termos complexos |
+| **Tasmania** | 0.4941 | Não-Linear - Regressão Linear é insuficiente |
+
+# Aprofundamento Teórico: O Limite da Linearidade em WECs
+
+A Regressão Linear assume que a relação entre as variáveis de entrada ($X$) e a saída ($Y$) segue uma linha reta.
+No entanto, o comportamento físico de um Wave Energy Converter (WEC) é intrinsecamente **não-linear**.
+
+## Por que a Regressão Linear falha em cenários como a Tasmania?
+
+O desempenho inferior observado em regiões de alta energia (como a Tasmania, com $R^2 \approx 0.49$) ocorre devido a três fenômenos principais que uma reta não consegue descrever:
+
+### 1. Interação Hidrodinâmica (Efeito de Sombreamento)
+
+Em uma fazenda de ondas, um WEC posicionado à frente de outro altera o campo de ondas para os dispositivos que estão atrás.
+
+\* **O Problema:** Essa "perda" de energia não é constante; ela varia de forma exponencial ou senoidal dependendo da frequência e altura da onda.
+
+\* **A Falha:** A regressão linear tenta somar ou subtrair valores fixos para cada coordenada, ignorando que a posição de um WEC afeta o outro de forma multiplicativa ou complexa.
+
+### 2. O Fenômeno de Ressonância
+
+WECs são projetados para ressonar com frequências específicas de ondas para maximizar a captura de energia.
+
+\* **O Problema:** A curva de captura de energia costuma ser em formato de "sino" (Distribuição Gaussiana).
+
+\* **A Falha:** Uma regressão linear tenta passar uma linha reta através de uma curva.
+Como resultado, ela erra drasticamente tanto no "pico" da curva (subestimando a potência) quanto nas "bordas" (superestimando-a).
+
+### 3. Underfitting (Subajuste)
+
+Quando usamos um modelo linear para dados curvos, ocorre o que chamamos de **Underfitting**.
+O modelo é simples demais para captar a "nuance" dos dados.
+
+\* No gráfico de Sydney, os pontos estão próximos da linha vermelha porque o mar lá é mais "comportado".
+
+\* Na Tasmania, a dispersão dos pontos longe da linha de 45° é o sinal visual de que existem padrões (curvas) nos dados que o modelo ignorou completamente.
+
+------------------------------------------------------------------------
+
+## Propostas de Evolução
+
+Para superar essas limitações em trabalhos futuros, existem dois caminhos principais:
+
+1.  **Regressão Polinomial:** Introduz termos de potência (ex: $X_1^2$, $X_1 \cdot X_2$). Isso permite que a "linha reta" se curve, ajustando-se melhor aos dados de mares energéticos.
+2.  **Modelos Baseados em Árvores (Random Forest/XGBoost):** Estes modelos não tentam traçar uma linha, mas sim dividir os dados em "caixas" de decisão. Eles são excelentes para captar as interações complexas entre as coordenadas X e Y que discutimos acima.
+
+@wave_energy_converters_494
+
+------------------------------------------------------------------------

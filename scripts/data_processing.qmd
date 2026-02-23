@@ -1,0 +1,522 @@
+---
+title: "Projeto 1 - Tratamento de Dados WECs"
+subtitle: "Wave Energy Converters Dataset"
+author: 
+  - name: "Pedro Muniz Cherulli"
+    affiliation: "UniCEUB – Ciência de Dados"
+    orcid: "0009-0000-0282-5776"
+date: "`r Sys.Date()`"
+lang: pt-BR
+keywords: [R, Python, Ciência de Dados, Deep Learning, Data Processing]
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+
+params:
+  env_name: "D:/venvs/deep_learning"
+
+bibliography: "../data/raw/ABNT/referencias.bib"
+csl: "../data/raw/ABNT/abnt.csl"
+---
+
+```{r include=FALSE}
+env_name <- params$env_name
+
+python_path <- system(
+  "py -3.12 -c \"import sys; print(sys.executable)\"",
+  intern = TRUE
+)
+
+Sys.setlocale("LC_TIME", "pt_BR.UTF-8")
+```
+
+```{r include=FALSE}
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+pacman::p_load(
+  reticulate,
+  knitr,
+  rmarkdown,
+  arrow
+) 
+
+if (!virtualenv_exists(env_name)) {
+  virtualenv_create(env_name, python = python_path)
+}
+
+use_virtualenv(env_name, required = TRUE)
+
+py_pkgs <- c(
+  "pandas",
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "seaborn",
+  "fastparquet"
+)
+
+installed_pkgs <- py_list_packages()$package
+missing_pkgs <- setdiff(py_pkgs, installed_pkgs)
+
+if (length(missing_pkgs) > 0) {
+  py_install(missing_pkgs, pip = TRUE)
+}
+
+reticulate::py_config()
+```
+
+# Dicionário de Variáveis (Dataset WEC)
+
+As colunas presentes na base de dados bruta e processada são descritas a seguir:
+
+-   `X1` a `X16`: Coordenadas cartesianas no eixo horizontal ($X$) para cada um dos 16 conversores de energia das ondas no arranjo.
+-   `Y1` a `Y16`: Coordenadas cartesianas no eixo vertical ($Y$) para cada um dos 16 conversores de energia das ondas no arranjo.
+-   `P1` a `P16`: Potência individual gerada por cada conversor (geralmente removidas após a consolidação para focar na performance do grupo).
+-   **`Powerall`**: Variável alvo (target) que representa a potência total líquida gerada pelo arranjo de 16 WECs, considerando as interações hidrodinâmicas.
+-   **`scenario`**: Identificador da localização geográfica e condições metereológicas do dataset (ex.: *Adelaide*, *Tasmania*, *Sydney* e *Perth*).
+
+O dataset abrange quatro localizações reais na costa australiana, cada uma com características distintas de espectro de onda:
+
+1.  **Adelaide:** Águas mais rasas e regime de ondas regular.
+2.  **Tasmania:** Alta energia e condições climáticas severas.
+3.  **Sydney:** Regime de ondas moderado.
+4.  **Perth:** Influência de ventos consistentes e swells de longo período.
+
+Área de Ocupação: Todas as coordenadas ($X, Y$) estão contidas dentro de uma área delimitada de 566m x 566m, definindo o espaço operacional da fazenda de ondas.
+
+@wave_energy_converters_494
+
+------------------------------------------------------------------------
+
+# Introdução e Objetivo
+
+Este projeto foca no processamento e engenharia de atributos de um dataset de **Conversores de Energia das Ondas (WECs - Wave Energy Converters)**. O objetivo principal é transformar coordenadas espaciais ($X, Y$) em um formato otimizado para modelos de *Regressão linear*, extraindo métricas geométricas que descrevam a disposição física dos conversores no oceano.
+
+A meta é criar um pipeline de dados para que o algoritmo de regressão consiga prever a eficiência do arranjo para cada cenário geográfico.
+
+## Detalhamento do Contexto e Desafios
+
+### O Efeito de Interação Hidrodinâmica
+
+O principal desafio na modelagem de fazendas de ondas (*WEC Farms*) é o **Efeito Wake (Esteira)**. Assim como em parques eólicos, quando um conversor extrai energia de uma onda, ele cria uma "sombra" ou zona de menor energia atrás de si, alterando o recurso disponível para os conversores vizinhos.
+
+A potência total ($Powerall$) é uma soma linear das potências individuais em isolamento, porém o posicionamento dos **WECs** impacta diretamente a quantidade de energia gerada por **WECs** adjacentes.
+
+$$Powerall = \sum_{i=1}^{16} P_i$$
+
+### Por que a Engenharia de Atributos é Vital para Regressão Linear?
+
+Modelos de Regressão Linear assumem que a variável dependente é uma combinação linear das variáveis independentes. No entanto, as coordenadas puras ($X, Y$) raramente têm uma relação linear direta com a potência. Ao extrair métricas como **distância ao centroide** e **distância mínima**, estamos:
+
+-   **Capturando Não-Linearidades:** A distância euclidiana (que envolve termos quadráticos e raízes) "pré-processa" a geometria para o modelo, permitindo que a regressão linear encontre coeficientes significativos para a dispersão espacial.
+-   **Tratando a Invariância Espacial:** O modelo passa a entender a relação *entre* os WECs, em vez de apenas suas posições absolutas no mapa.
+
+------------------------------------------------------------------------
+
+# Pipeline de Processamento e Engenharia de Atributos
+
+## Leitura e Consolidação dos Dados
+
+-   Leitura dos arquivos CSV brutos para cada cenário (*Adelaide*, *Tasmania*, *Sydney*, *Perth*).
+-   Atribuição de nomes de colunas e adição de uma coluna `scenario` para identificar a origem dos dados.
+-   Salvamento em formato `.parquet` para otimização de leitura e escrita.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+
+BASE_DIR = Path().resolve().parent
+RAW_DIR = BASE_DIR / "data" / "raw"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+files = {
+    "Adelaide": "Adelaide_Data.csv",
+    "Tasmania": "Tasmania_Data.csv",
+    "Sydney": "Sydney_Data.csv",
+    "Perth": "Perth_Data.csv"
+}
+
+x_cols = [f"X{i}" for i in range(1, 17)]
+y_cols = [f"Y{i}" for i in range(1, 17)]
+p_cols = [f"P{i}" for i in range(1, 17)]
+
+columns = x_cols + y_cols + p_cols + ["Powerall"]
+
+dfs = []
+
+for scenario, filename in files.items():
+    
+    df = pd.read_csv(RAW_DIR / filename, header=None)
+    df.columns = columns
+
+    df["scenario"] = scenario
+
+    output_path = PROCESSED_DIR / f"{scenario.lower()}.parquet"
+    df.to_parquet(output_path, index=False, engine="fastparquet")
+
+    print(f"{scenario} salvo em {output_path}")
+    
+    dfs.append(df)
+    
+wec_all = pd.concat(dfs, ignore_index=True)
+
+output_path = PROCESSED_DIR / "wec_all.parquet"
+wec_all.to_parquet(output_path, index=False, engine="fastparquet")
+
+print(f"\nDataset final salvo em: {output_path}")
+print(f"Shape final: {wec_all.shape}")
+```
+
+## Remoção de Colunas de Potência Individual
+
+1.  A decisão de remover as colunas `P1` a `P16` foi tomada para evitar que o modelo de regressão linear se torne dependente das potências individuais, que não estarão disponíveis em um cenário de previsão real. O foco é extrair informações geométricas dos WECs, como suas posições relativas, para prever a potência total `Powerall`.
+
+2.  Evitar a multicolinearidade: As potências individuais estão altamente correlacionadas com a potência total, o que pode levar a problemas de *Dataleakage*, já que:
+
+$$Powerall = \sum_{i=1}^{16} P_i$$
+
+```{python}
+import pandas as pd
+
+df = pd.read_parquet(PROCESSED_DIR / "wec_all.parquet")
+
+p_cols = [f"P{i}" for i in range(1, 17)]
+df.drop(columns=p_cols, inplace=True)
+df
+```
+
+## Análise Exploratória e Visualização
+
+Nesta etapa, realizamos uma análise exploratória dos dados para entender a estrutura, identificar valores faltantes e visualizar a disposição dos WECs no plano cartesiano.
+
+```{python}
+import pandas as pd
+
+pd.set_option('display.max_columns', None)
+print(df.shape, "\n")
+print(df.info(), "\n")
+print("Valores faltantes (NAs):\n", df.isnull().sum(), "\n")
+print("Moda por coluna:\n", df.mode().iloc[0])
+```
+
+### Conclusões pós Análise Superficiais
+
+1.  O dataset consolidado contém **287.999** linhas e **49** colunas, sem valores faltantes.
+2.  A maior parte das colunas de coordenadas (`X1` a `Y16`) tem uma moda de 0 ou 566, indicando que muitos WECs estão posicionados em coordenadas próximas ou idênticas, o que pode sugerir agrupamentos ou padrões de arranjo específicos.
+
+## Visualização da Disposição dos WECs
+
+### O que é um **WEC**?
+
+*WECs* (Wave Energy Converters) são dispositivos projetados para **converter a energia das ondas em eletricidade**. Eles podem assumir diferentes formatos, como:
+
+-   **Bóias flutuantes:** Capturam energia a partir do movimento vertical das ondas.
+-   **Colunas oscilantes:** Estruturas fixas ou semi-flutuantes que se movem com a pressão ou deslocamento da água.
+-   **Plataformas flutuantes:** Sistemas maiores, capazes de gerar mais energia em conjunto.
+
+A posição de cada WEC dentro de uma fazenda de ondas é **crucial**, pois o arranjo influencia diretamente a eficiência energética. Certos padrões podem **minimizar interferências hidrodinâmicas** e maximizar a captura de energia de cada dispositivo.
+
+![](images/PRIMRE-Flap.webp){fig-align="left" width="266"} ![](images/point-absorber1.gif){fig-align="right" width="333"}
+
+Abaixo, apresentamos uma **visualização do layout de uma fazenda de WECs**, mostrando diferentes formas de posicionamento. Essa visualização ajuda a compreender como **a distribuição espacial afeta a eficiência global**:
+
+```{python}
+import matplotlib.pyplot as plt
+import numpy as np
+
+random_idx = np.random.randint(0, len(df))
+
+x_values = df[[f"X{i}" for i in range(1, 17)]].iloc[random_idx].values
+y_values = df[[f"Y{i}" for i in range(1, 17)]].iloc[random_idx].values
+
+plt.figure(figsize=(6,6))
+plt.scatter(x_values, y_values, color='blue')
+
+for i in range(16):
+    plt.text(x_values[i], y_values[i], f"WEC{i+1}")
+
+plt.xlim(0, 566)
+plt.ylim(0, 566)
+plt.gca().set_aspect('equal')
+plt.title("Exemplo de Layout de WECs")
+plt.xlabel("Coordenada X (m)")
+plt.ylabel("Coordenada Y (m)")
+plt.show()
+```
+
+## Ganhos e insights possíveis com diferentes arranjos:
+
+-   **Disposição regular:** Reduz interferências entre WECs, facilita manutenção e controle.
+-   **Disposição escalonada ou hexagonal:** Aumenta a densidade de energia capturada e reduz sombras hidrodinâmicas.
+-   **Arranjos adaptativos:** Baseados em modelagem computacional ou simulação de ondas para maximizar a eficiência energética.
+
+# Criação de Novas Features
+
+Nesta etapa, calculamos métricas geométricas a partir das coordenadas dos WECs para capturar a disposição espacial e as interações hidrodinâmicas:
+
+-   **Distâncias Mínimas entre WECs:** Calcula as distâncias entre
+-   **Distância ao Centroide:** Calcula a distância de cada WEC ao centroide do arranjo, fornecendo uma medida de dispersão espacial.
+
+------------------------------------------------------------------------
+
+## Distância Euclidiana entre WECs
+
+### O que é?
+
+A **distância euclidiana** é a maneira mais direta de medir a separação entre dois pontos em um plano 2D. No contexto das fazendas de **Wave Energy Converters (WECs)**, ela nos permite quantificar **o espaço físico entre cada par de dispositivos**, que é essencial para analisar interferências hidrodinâmicas e eficiência energética.
+
+------------------------------------------------------------------------
+
+### Fórmula Matemática
+
+Para dois pontos $(i$) e $(j)$ com coordenadas $(X_i, Y_i)$ e $(X_j, Y_j)$, a distância euclidiana é calculada como:
+
+$d_{ij} = \sqrt{(X_i - X_j)^2 + (Y_i - Y_j)^2}, \quad i,j = 1,2,...,N, \quad i < j$
+
+Onde:
+
+-   $(N)$ é o número total de WECs em uma fazenda.
+
+-   $(d_{ij})$ é a **distância direta “linha reta”** entre o WEC $(i)$ e o WEC $(j)$.
+
+------------------------------------------------------------------------
+
+### Como o código escolhe os pontos?
+
+1.  **Seleção dos pontos:** Cada linha do dataframe representa **uma configuração da fazenda de WECs**. Para essa linha, o código cria uma lista de **tuplas** de coordenadas:
+
+$coords = [(X_1, Y_1), (X_2, Y_2), ..., (X_N, Y_N)]$
+
+-   **Gerando pares de WECs:** Usamos `combinations(coords, 2)` do Python, que gera **todos os pares possíveis de WECs sem repetição**.
+
+-   Para 16 WECs, isso resulta em $(\binom{16}{2} = 120)$ pares.
+
+-   Cada par é do tipo $(X_i, Y_i), (X_j, Y_j)$.
+
+-   **Cálculo da distância:** Para cada par, aplica-se a fórmula da distância euclidiana:
+
+$d_{ij} = \sqrt{(X_i - X_j)^2 + (Y_i - Y_j)^2}$
+
+O resultado é uma **lista com todas as distâncias entre pares**, que representa o “mapa de separações” da fazenda.
+
+------------------------------------------------------------------------
+
+### Estatísticas derivadas
+
+A partir das distâncias entre todos os pares, podemos extrair métricas que descrevem o layout da fazenda:
+
+-   **Média:**
+
+$\bar{d} = \frac{1}{M} \sum_{i<j} d_{ij}, \quad M = \binom{N}{2}$
+
+Por que a média é representada assim?
+
+-   $(M = \binom{N}{2} = \frac{N(N-1)}{2})$ é o **número total de pares únicos**.
+
+-   O somatório $(\sum_{i<j} d_{ij})$ adiciona **todas as distâncias entre pares únicos**.
+
+-   Dividindo pelo total de pares $(M)$, obtemos a **distância média entre todos os WECs**, que representa o **espaçamento médio da fazenda**.
+
+-   **Mínimo:**
+
+$d_{min} = \min(d_{ij})$
+
+-   **Máximo:**
+
+$d_{max} = \max(d_{ij})$
+
+-   **Desvio padrão:**
+
+$\sigma_d = \sqrt{\frac{1}{M} \sum_{i<j} (d_{ij} - \bar{d})^2}$
+
+Estas estatísticas permitem avaliar:
+
+-   **Proximidade crítica entre WECs** (evitar interferência hidrodinâmica).
+-   **Uniformidade do layout** (distribuição regular ou concentrada).
+-   **Potencial de eficiência energética** baseado na posição relativa dos dispositivos.
+
+------------------------------------------------------------------------
+
+### Por que é importante?
+
+1.  **Evitar interferências entre WECs:** Dispositivos muito próximos podem “sombrear” uns aos outros, reduzindo a eficiência da captura de energia.
+
+2.  **Caracterizar o layout da fazenda:** A distância média e o desvio padrão ajudam a identificar padrões espaciais, como agrupamentos ou dispersão uniforme.
+
+3.  **Fornecer features para modelos de predição:** Estatísticas das distâncias podem ser usadas como **entradas em modelos de regressão ou machine learning**, ajudando a prever a potência total gerada (`Powerall`).
+
+------------------------------------------------------------------------
+
+### Visualização Intuitiva
+
+Se representarmos cada WEC como um ponto em um plano 2D, a distância euclidiana é a **linha reta** que conecta dois pontos, sem se importar com o caminho das ondas ou obstáculos. Para todos os pares, podemos pensar em uma **“rede de linhas”** conectando cada dispositivo a todos os outros.
+
+```{python}
+import pandas as pd
+import numpy as np
+from itertools import combinations
+
+n_wecs = 16
+x_cols = [f"X{i}" for i in range(1, n_wecs+1)]
+y_cols = [f"Y{i}" for i in range(1, n_wecs+1)]
+
+def euclidean_distance(x1, y1, x2, y2):
+    return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+
+def pairwise_distances(row):
+    coords = [(row[x_cols[i]], row[y_cols[i]]) for i in range(n_wecs)]
+    dists = [euclidean_distance(x1, y1, x2, y2) 
+             for (x1, y1), (x2, y2) in combinations(coords, 2)]
+    return dists
+
+df['pairwise_distances'] = df.apply(pairwise_distances, axis=1)
+
+df['dist_mean'] = df['pairwise_distances'].apply(np.mean)
+df['dist_min'] = df['pairwise_distances'].apply(np.min)
+df['dist_max'] = df['pairwise_distances'].apply(np.max)
+df['dist_std'] = df['pairwise_distances'].apply(np.std)
+
+print(df[['dist_mean','dist_min','dist_max','dist_std']].head())
+```
+
+## Distância de cada WEC ao Centroide
+
+### O que é o centroide?
+
+O **centroide** é o **ponto médio** de todos os WECs em uma fazenda, ou seja, o “coração geométrico” da configuração. Se temos $(N)$ WECs com coordenadas $(X_i, Y_i)$, o centroide é calculado como:
+
+$\text{centroid}_x = \frac{1}{N} \sum_{i=1}^{N} X_i, \quad\text{centroid}_y = \frac{1}{N} \sum_{i=1}^{N} Y_i$
+
+-   ((\text{centroid}\_x, \text{centroid}\_y)) representa **a posição média de todos os WECs**.
+-   Ele é usado como referência para avaliar **quão dispersos ou concentrados estão os WECs**.
+
+------------------------------------------------------------------------
+
+### Distância de cada WEC até o centroide
+
+Para cada WEC $(i)$, a distância ao centroide é:
+
+$d_i^{\text{centroid}} = \sqrt{(X_i - \text{centroid}_x)^2 + (Y_i - \text{centroid}_y)^2}, \quad i = 1, 2, ..., N$
+
+-   Cada WEC é comparado **apenas com o centroide**.
+-   O cálculo é novamente **uma hipotenusa** de um triângulo retângulo formado pela diferença de coordenadas X e Y do WEC até o centroide.
+
+------------------------------------------------------------------------
+
+### Estatísticas derivadas
+
+Com a lista de distâncias $({d_1^{\text{centroid}}, d_2^{\text{centroid}}, ..., d_N^{\text{centroid}}})$ podemos calcular:
+
+-   **Distância média ao centroide:**
+
+$\bar{d}*{\text{centroid}} = \frac{1}{N} \sum_{i=1}^{N} d_i^{\text{centroid}}$
+
+-   **Desvio padrão das distâncias ao centroide:**
+
+$\sigma_{\text{centroid}} = \sqrt{\frac{1}{N} \sum_{i=1}^{N} (d_i^{\text{centroid}} - \bar{d}_{\text{centroid}})^2}$
+
+Essas métricas permitem:
+
+1.  Avaliar a **dispersão da fazenda**:
+
+    -   $(\bar{d}_{\text{centroid}})$ grande → WECs muito afastados do centro.
+    -   $(\sigma_{\text{centroid}})$ grande → WECs distribuídos de forma desigual.
+
+2.  Criar **features para modelagem preditiva**, ajudando a explicar variações na potência gerada.
+
+------------------------------------------------------------------------
+
+### Por que é diferente da distância entre pares?
+
+-   **Distância entre pares:** considera **todos os pares possíveis de WECs**, gerando $\binom{N}{2}$ valores.
+
+-   **Distância até o centroide:** considera **cada WEC apenas em relação ao centro geométrico**, gerando $(N)$ valores.
+
+-   Ambas ajudam a caracterizar a fazenda, mas o centroide **resuma a posição global** enquanto as distâncias entre pares **resumem a interação local**.
+
+------------------------------------------------------------------------
+
+### Visualização Intuitiva
+
+Imagine uma fazenda com 16 WECs espalhados:
+
+-   O **centroide** é o ponto médio (como o *baricentro*) da distribuição.
+-   Cada WEC está conectado ao centroide por uma **linha reta**, que é a hipotenusa do triângulo formado pelas diferenças de coordenadas X e Y.
+
+Isso dá uma ideia clara de **quão centralizados ou dispersos os WECs estão**.
+
+------------------------------------------------------------------------
+
+```{python}
+import pandas as pd
+import numpy as np
+from itertools import combinations
+
+df['centroid_x'] = df[x_cols].mean(axis=1)
+df['centroid_y'] = df[y_cols].mean(axis=1)
+
+def dist_to_centroid(row):
+    centroid = (row['centroid_x'], row['centroid_y'])
+    dists = [euclidean_distance(row[x_cols[i]], row[y_cols[i]], *centroid)
+             for i in range(n_wecs)]
+    return dists
+
+df['dist_to_centroid'] = df.apply(dist_to_centroid, axis=1)
+
+df['centroid_dist_mean'] = df['dist_to_centroid'].apply(np.mean)
+df['centroid_dist_std'] = df['dist_to_centroid'].apply(np.std)
+
+df = df.drop(columns=['pairwise_distances', 'dist_to_centroid'])
+
+print(df[['centroid_dist_mean','centroid_dist_std']].head())
+```
+
+## "Matriz de Correlação"
+
+A matriz de correlação é uma ferramenta estatística que mostra a relação linear entre cada par de variáveis em um dataset. No contexto do nosso projeto, ela nos ajuda a entender como as novas features geométricas (como `dist_mean`, `dist_min`, `centroid_dist_mean`, etc.) estão relacionadas com a variável alvo `Powerall`. Foi utilizado " " porque não é uma matriz de correlação tradicional entre todas as variáveis, mas sim um gráfico de calor focado na correlação de cada feature com `Powerall`, já que a base de dados possui muitas colunas, e o objetivo é destacar a correlação de cada feature com a variável alvo.
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Seleciona apenas as colunas numéricas
+df_numeric = df.select_dtypes(include=[np.number])
+
+# Calcula a correlação com PowerAll
+corr_with_target = df_numeric.corr()['Powerall'].drop('Powerall')  # remove a correlação consigo mesmo
+
+# Converte para DataFrame para usar no heatmap
+corr_df = corr_with_target.to_frame().sort_values(by='Powerall', ascending=False)
+
+plt.figure(figsize=(6, len(corr_df)*0.3))  # ajusta altura dinamicamente
+sns.heatmap(corr_df, annot=True, fmt=".2f", cmap="coolwarm", cbar=True)
+plt.title("Correlação de cada feature com Powerall")
+plt.show()
+```
+
+### Interpretação Geral
+
+A baixa magnitude das correlações reforça que **a relação entre layout dos WECs e potência total é complexa e não-linear**, justificando a necessidade de:
+
+-   Features derivadas (distâncias entre pares, distâncias ao centroide, métricas estatísticas).
+-   Modelos mais sofisticados que capturem interações e efeitos não-lineares, como **regressão polinomial ou modelos baseados em árvores**.
+
+Em resumo, **nenhuma feature isolada tem poder explicativo forte**, mas a combinação de várias métricas espaciais pode fornecer insights importantes para previsão de `Powerall`.
+
+# Exportação da Base de Dados Tratada
+
+-   Novas Features Criadas para melhor desempenho do Modelo
+-   Salvamento em formato `.parquet` para otimização de leitura e escrita.
+
+```{python}
+output_path = PROCESSED_DIR / "wec_all_processed.parquet"
+df.to_parquet(output_path, engine="fastparquet")
+print(f"\nDataset Tratado salvo em: {output_path}")
+```
+
+------------------------------------------------------------------------
