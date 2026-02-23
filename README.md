@@ -18,6 +18,7 @@ O projeto está dividido em duas etapas principais:
 │ ├── raw/\
 │ └── processed/\
 ├── ABNT/\
+├──P1_RL.Rproj\
 └── README.md
 
 ---
